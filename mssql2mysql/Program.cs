@@ -31,6 +31,11 @@ namespace mssql2mysql
 
         [Option(Description = "MySQL Schema")]
         public string Schema { get; set; }
+        
+        [Option(Description = "Ignore tables")] public string[] IgnoreTables { get; set; }
+        [Option(Description = "Table")] public string TableName { get; set; }
+        [Option(Description = "With data")] public int WithData { get; set; }
+        
         private int OnExecute()
         {
             if (ConnectionString == null)
@@ -38,26 +43,45 @@ namespace mssql2mysql
                 return 1;
             }
             FileName = FileName ?? "dump.sql";
-            using (FileStream fileStream = new FileStream(FileName, FileMode.Create))
+            using (var fileStream = new FileStream(FileName, FileMode.Create))
             {
-                using (StreamWriter writer = new StreamWriter(fileStream, Encoding.UTF8))
+                using (var writer = new StreamWriter(fileStream, Encoding.UTF8))
                 {
-                    writer.WriteLine("/* https://github.com/SeriaWei/mssql2mysql */");
-                    writer.WriteLine();
-                    writer.WriteLine();
+                    // inserts only, if table name was specified
+                    if (!string.IsNullOrEmpty(TableName) && WithData == 1)
+                    {
+                        writer.WriteLine("SET FOREIGN_KEY_CHECKS=0;");
+                        writer.WriteLine(GetData(TableName));
+                        writer.WriteLine("SET FOREIGN_KEY_CHECKS=1;");
+                        GetDbConnection().Close();
+                        Console.WriteLine("Save to: " + FileName);
+                        return 0;
+                    }
+                    
                     if (Schema != null)
                     {
                         writer.WriteLine($"CREATE DATABASE  IF NOT EXISTS `{Schema}` /*!40100 DEFAULT CHARACTER SET latin1 */;");
                         writer.WriteLine($"USE `{Schema}`;");
                         writer.WriteLine();
                     }
+                    
                     writer.WriteLine("SET FOREIGN_KEY_CHECKS=0;");
-                    foreach (var item in GetTalbes().ToArray())
+                    foreach (var item in GetTables().ToArray())
                     {
-                        Console.WriteLine("Generating: " + item);
-                        writer.WriteLine(GetTableSchema(item));
+                        if (IgnoreTables!=null && IgnoreTables.Any(x => x == item))
+                        {
+                            Console.WriteLine("Skipping: " + item);
+                        }
+                        else
+                        {
+                            Console.WriteLine("Generating: " + item);
+                            writer.WriteLine(GetTableSchema(item));
+                        }
                         writer.WriteLine();
-                        writer.WriteLine(GetData(item));
+                        if (WithData == 1)
+                        {
+                            writer.WriteLine(GetData(item));
+                        }
                     }
                     writer.WriteLine("SET FOREIGN_KEY_CHECKS=1;");
                 }
@@ -77,12 +101,12 @@ namespace mssql2mysql
             return SqlConnection;
         }
 
-        private IEnumerable<string> GetTalbes()
+        private IEnumerable<string> GetTables()
         {
             using (DbCommand dbCommand = GetDbConnection().CreateCommand())
             {
                 dbCommand.CommandText = "EXEC sys.sp_tables NULL,'dbo',NULL,'''TABLE'''";
-                DbDataReader reader = dbCommand.ExecuteReader();
+                var reader = dbCommand.ExecuteReader();
                 if (reader.HasRows)
                 {
                     while (reader.Read())
@@ -95,55 +119,56 @@ namespace mssql2mysql
         }
         private string GetTableSchema(string tableName)
         {
-            StringBuilder builder = new StringBuilder();
+            var builder = new StringBuilder();
             using (DbCommand dbCommand = GetDbConnection().CreateCommand())
             {
                 dbCommand.CommandText = "EXEC sys.sp_columns '" + tableName + "';";
-                DbDataReader reader = dbCommand.ExecuteReader();
-                if (reader.HasRows)
+                var reader = dbCommand.ExecuteReader();
+                if (!reader.HasRows) return "";
+                
+                builder.AppendLine("DROP TABLE IF EXISTS `" + tableName + "`;");
+                builder.AppendLine("CREATE TABLE `" + tableName + "` (");
+                var columnBuilder = new StringBuilder();
+                while (reader.Read())
                 {
-                    builder.AppendLine("DROP TABLE IF EXISTS `" + tableName + "`;");
-                    builder.AppendLine("CREATE TABLE `" + tableName + "` (");
-                    StringBuilder columnBuilder = new StringBuilder();
-                    while (reader.Read())
+                    if(reader.GetString(3).StartsWith("old"))
+                        continue;
+                    string nullable;
+                    if (reader.GetInt16(10) == 1)
                     {
-                        string nullable;
-                        if (reader.GetInt16(10) == 1)
-                        {
-                            nullable = " NULL";
-                        }
-                        else { nullable = " NOT NULL"; }
-                        int size = reader.GetInt32(7);
-                        int precision = reader.GetInt32(6);
-                        int? scale = null;
-                        if (reader.GetValue(8) != System.DBNull.Value)
-                        {
-                            scale = reader.GetInt16(8);
-                        }
-                        string dbType = GetDataType(reader.GetString(5), size, precision, scale);
-                        if (columnBuilder.Length > 0)
-                        {
-                            columnBuilder.AppendLine(",");
-                        }
-                        columnBuilder.Append($"\t`{reader.GetString(3)}` {dbType} {nullable}");
+                        nullable = " NULL";
                     }
-                    reader.Close();
-                    string primaryKey = GetPrimaryKey(tableName);
-                    if (primaryKey != null)
+                    else { nullable = " NOT NULL"; }
+                    var size = reader.GetInt32(7);
+                    var precision = reader.GetInt32(6);
+                    int? scale = null;
+                    if (reader.GetValue(8) != System.DBNull.Value)
+                    {
+                        scale = reader.GetInt16(8);
+                    }
+                    var dbType = GetDataType(reader.GetString(5), size, precision, scale);
+                    if (columnBuilder.Length > 0)
                     {
                         columnBuilder.AppendLine(",");
-                        columnBuilder.Append(primaryKey);
                     }
-                    string foreignKey = GetForeignKey(tableName);
-                    if (foreignKey != null)
-                    {
-                        columnBuilder.AppendLine(",");
-                        columnBuilder.Append(foreignKey);
-                    }
-                    columnBuilder.AppendLine();
-                    columnBuilder.Append(");");
-                    builder.Append(columnBuilder.ToString());
+                    columnBuilder.Append($"\t`{reader.GetString(3)}` {dbType} {nullable}");
                 }
+                reader.Close();
+                var primaryKey = GetPrimaryKey(tableName);
+                if (primaryKey != null)
+                {
+                    columnBuilder.AppendLine(",");
+                    columnBuilder.Append(primaryKey);
+                }
+                var foreignKey = GetForeignKey(tableName);
+                if (foreignKey != null)
+                {
+                    columnBuilder.AppendLine(",");
+                    columnBuilder.Append(foreignKey);
+                }
+                columnBuilder.AppendLine();
+                columnBuilder.Append(");");
+                builder.Append(columnBuilder.ToString());
             }
             return builder.ToString();
         }
@@ -153,55 +178,67 @@ namespace mssql2mysql
             {
                 return $"VARCHAR({size / 2}) CHARACTER SET utf8mb4";
             }
-            else if (type == "varchar")
+
+            if (type == "varchar")
             {
                 return $"VARCHAR({size}) CHARACTER SET utf8mb4";
             }
-            else if (type == "text" || type == "ntext")
+            if (type == "text" || type == "ntext")
             {
                 return "LONGTEXT CHARACTER SET utf8mb4";
             }
-            else if (type == "char" || type == "nchar")
+            if (type == "char" || type == "nchar")
             {
                 return $"CHAR({size}) CHARACTER SET utf8mb4";
             }
-            else if (type == "int" || type == "int8")
+            if (type == "int" || type == "int8")
             {
                 return "INT";
             }
-            else if (type == "datetime" || type == "smalldatetime")
+            
+            if (type=="smallint")
+            {
+                return "SMALLINT";
+            }
+            
+            if (type == "datetime" || type == "smalldatetime" || type == "datetimeoffset")
             {
                 return "DATETIME";
             }
-            else if (type == "image" || type == "binary" || type == "varbinary")
+
+            if (type == "uniqueidentifier")
+                return "CHAR(13)";
+            
+            if (type == "image" || type == "binary" || type == "varbinary")
             {
                 return "LONGBLOB";
             }
-            else if (type == "money" || type == "smallmoney" || type == "decimal" || type == "numeric")
+            if (type == "money" || type == "smallmoney" || type == "decimal" || type == "numeric")
             {
                 return $"DECIMAL ({precision},{scale})";
             }
-            else if (type == "float" || type == "real")
+            if (type == "float" || type == "real")
             {
                 return "FLOAT";
             }
-            else if (type == "bit")
+            if (type == "bit")
             {
                 return "TINYINT(1)";
             }
-            else if (type == "int identity")
+            if (type == "int identity")
             {
                 return "INT AUTO_INCREMENT";
             }
-            return type.ToUpper();
+
+            return "NOTFOUND"; //type.ToUpper();
         }
         private string GetPrimaryKey(string tableName)
         {
-            HashSet<string> primaryKeys = new HashSet<string>();
+            var primaryKeys = new HashSet<string>();
             using (DbCommand dbCommand = GetDbConnection().CreateCommand())
             {
                 dbCommand.CommandText = $"EXEC sys.sp_indexes_rowset '{tableName}'";
-                DbDataReader reader = dbCommand.ExecuteReader();
+                var reader = dbCommand.ExecuteReader();
                 if (reader.HasRows)
                 {
                     while (reader.Read())
@@ -220,11 +257,11 @@ namespace mssql2mysql
         }
         private string GetForeignKey(string tableName)
         {
-            StringBuilder foreignKeys = new StringBuilder();
+            var foreignKeys = new StringBuilder();
             using (DbCommand dbCommand = GetDbConnection().CreateCommand())
             {
                 dbCommand.CommandText = $"EXEC sys.sp_fkeys @fktable_name='{tableName}'";
-                DbDataReader reader = dbCommand.ExecuteReader();
+                var reader = dbCommand.ExecuteReader();
                 if (reader.HasRows)
                 {
                     while (reader.Read())
@@ -244,17 +281,18 @@ namespace mssql2mysql
         }
         private string GetData(string tableName)
         {
-            StringBuilder builder = new StringBuilder();
-            List<string> columns = new List<string>();
+            var builder = new StringBuilder();
+            var columns = new List<string>();
             using (DbCommand dbCommand = GetDbConnection().CreateCommand())
             {
                 dbCommand.CommandText = "EXEC sys.sp_columns '" + tableName + "';";
-                DbDataReader reader = dbCommand.ExecuteReader();
+                var reader = dbCommand.ExecuteReader();
                 if (reader.HasRows)
                 {
                     while (reader.Read())
                     {
-                        columns.Add($"[{reader.GetString(3)}]");
+                        if(!reader.GetString(3).StartsWith("old"))
+                            columns.Add($"[{reader.GetString(3)}]");
                     }
                 }
                 reader.Close();
@@ -263,16 +301,16 @@ namespace mssql2mysql
             using (DbCommand dbCommand = GetDbConnection().CreateCommand())
             {
                 dbCommand.CommandText = $"SELECT {string.Join(",", columns)} FROM [{tableName}];";
-                DbDataReader reader = dbCommand.ExecuteReader();
+                var reader = dbCommand.ExecuteReader();
                 if (reader.HasRows)
                 {
                     builder.AppendLine($"/*!40000 ALTER TABLE `{tableName}` DISABLE KEYS */;");
                     builder.AppendLine($"INSERT INTO `{tableName}` VALUES");
-                    int rowIndex = 0;
+                    var rowIndex = 0;
                     while (reader.Read())
                     {
-                        List<string> values = new List<string>();
-                        for (int i = 0; i < reader.FieldCount; i++)
+                        var values = new List<string>();
+                        for (var i = 0; i < reader.FieldCount; i++)
                         {
                             values.Add(FormatValue(reader.GetValue(i)).ToString());
                         }
@@ -292,23 +330,36 @@ namespace mssql2mysql
         }
         private object FormatValue(object value)
         {
-            if (value == System.DBNull.Value)
+            if (value == DBNull.Value)
             {
                 return "NULL";
             }
-            Type valueType = value.GetType();
+            var valueType = value.GetType();
             if (valueType == StringType)
             {
-                return $"'{value.ToString().Replace("'", "''").Replace("\"", "\\\"")}'";
+                return $"'{value.ToString()!.Replace("'", "''").Replace("\"", "\\\"").Replace("\\",@"\\")}'";
             }
-            else if (valueType == DateTimeType)
+
+            if (valueType == typeof(Guid))
+            {
+                return $"'{((Guid)value).ToString()}'";
+            }
+
+            if (valueType == typeof(DateTimeOffset))
+            {
+                return
+                    $"'{((DateTimeOffset)value).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)}'";
+            }
+            
+            if (valueType == DateTimeType)
             {
                 return $"'{Convert.ToDateTime(value).ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)}'";
             }
-            else if (valueType == BoolType)
+            if (valueType == BoolType)
             {
                 return Convert.ToBoolean(value) ? 1 : 0;
             }
+
             return value;
         }
     }
